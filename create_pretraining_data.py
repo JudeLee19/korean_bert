@@ -189,6 +189,7 @@ def create_training_instances(input_files, tokenizer, max_seq_length,
     with tf.gfile.GFile(input_file, "r") as reader:
       while True:
         line = tokenization.convert_to_unicode(reader.readline())
+        # print(line)
         if not line:
           break
         line = line.strip()

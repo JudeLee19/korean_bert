@@ -128,13 +128,14 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
     is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
-    model = modeling.BertModel(
-        config=bert_config,
-        is_training=is_training,
-        input_ids=input_ids,
-        input_mask=input_mask,
-        token_type_ids=segment_ids,
-        use_one_hot_embeddings=use_one_hot_embeddings)
+    with tf.variable_scope("BERT", reuse=tf.AUTO_REUSE) as scope:
+        model = modeling.BertModel(
+            config=bert_config,
+            is_training=is_training,
+            input_ids=input_ids,
+            input_mask=input_mask,
+            token_type_ids=segment_ids,
+            use_one_hot_embeddings=use_one_hot_embeddings)
 
     (masked_lm_loss,
      masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
@@ -174,14 +175,24 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
-      train_op = optimization.create_optimizer(
+      # train_op = optimization.create_optimizer(
+      #     total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+
+      global_step = tf.train.get_or_create_global_step()
+      optimizer = optimization.create_optimizer(
           total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
 
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode,
-          loss=total_loss,
-          train_op=train_op,
-          scaffold_fn=scaffold_fn)
+      optimizer = tf.contrib.estimator.TowerOptimizer(optimizer)
+
+      train_op = optimizer.minimize(total_loss, global_step)
+
+      output_spec = tf.estimator.EstimatorSpec(mode=mode, loss=total_loss, train_op=train_op)
+
+      # output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+      #     mode=mode,
+      #     loss=total_loss,
+      #     train_op=train_op,
+      #     scaffold_fn=scaffold_fn)
     elif mode == tf.estimator.ModeKeys.EVAL:
 
       def metric_fn(masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
@@ -219,16 +230,22 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
             "next_sentence_loss": next_sentence_mean_loss,
         }
 
-      eval_metrics = (metric_fn, [
-          masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
+      # eval_metrics = (metric_fn, [
+      #     masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
+      #     masked_lm_weights, next_sentence_example_loss,
+      #     next_sentence_log_probs, next_sentence_labels
+      # ])
+
+      eval_metrics = metric_fn(masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
           masked_lm_weights, next_sentence_example_loss,
-          next_sentence_log_probs, next_sentence_labels
-      ])
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode,
-          loss=total_loss,
-          eval_metrics=eval_metrics,
-          scaffold_fn=scaffold_fn)
+          next_sentence_log_probs, next_sentence_labels)
+
+      output_spec = tf.estimator.EstimatorSpec(mode=mode, loss=total_loss, eval_metric_ops=eval_metrics)
+      # output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+      #     mode=mode,
+      #     loss=total_loss,
+      #     eval_metrics=eval_metrics,
+      #     scaffold_fn=scaffold_fn)
     else:
       raise ValueError("Only TRAIN and EVAL modes are supported: %s" % (mode))
 
@@ -330,7 +347,8 @@ def input_fn_builder(input_files,
 
   def input_fn(params):
     """The actual input function."""
-    batch_size = params["batch_size"]
+    # batch_size = params["batch_size"]
+    batch_size = FLAGS.train_batch_size if is_training else FLAGS.eval_batch_size
 
     name_to_features = {
         "input_ids":
@@ -427,15 +445,20 @@ def main(_):
         FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
 
   is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
+  # run_config = tf.contrib.tpu.RunConfig(
+  #     cluster=tpu_cluster_resolver,
+  #     master=FLAGS.master,
+  #     model_dir=FLAGS.output_dir,
+  #     save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+  #     tpu_config=tf.contrib.tpu.TPUConfig(
+  #         iterations_per_loop=FLAGS.iterations_per_loop,
+  #         num_shards=FLAGS.num_tpu_cores,
+  #         per_host_input_for_training=is_per_host))
+
+  run_config = tf.estimator.RunConfig(
       model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          iterations_per_loop=FLAGS.iterations_per_loop,
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+      save_checkpoints_steps=FLAGS.save_checkpoints_steps
+  )
 
   model_fn = model_fn_builder(
       bert_config=bert_config,
@@ -448,12 +471,17 @@ def main(_):
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
-      model_fn=model_fn,
-      config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      eval_batch_size=FLAGS.eval_batch_size)
+
+  # estimator = tf.contrib.tpu.TPUEstimator(
+  #     use_tpu=FLAGS.use_tpu,
+  #     model_fn=tf.contrib.estimator.replicate_model_fn(model_fn),
+  #     config=run_config,
+  #     train_batch_size=FLAGS.train_batch_size,
+  #     eval_batch_size=FLAGS.eval_batch_size)
+
+  estimator = tf.estimator.Estimator(
+      model_fn=tf.contrib.estimator.replicate_model_fn(model_fn),
+      config=run_config)
 
   if FLAGS.do_train:
     tf.logging.info("***** Running training *****")

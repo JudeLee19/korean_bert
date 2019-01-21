@@ -22,6 +22,8 @@ import collections
 import unicodedata
 import six
 import tensorflow as tf
+import re
+import subprocess
 
 
 def convert_to_unicode(text):
@@ -86,7 +88,10 @@ def convert_by_vocab(vocab, items):
   """Converts a sequence of [tokens|ids] using the vocab."""
   output = []
   for item in items:
-    output.append(vocab[item])
+    if item in vocab:
+      output.append(vocab[item])
+    else:
+      output.append(vocab['[UNK]'])
   return output
 
 
@@ -99,7 +104,7 @@ def convert_ids_to_tokens(inv_vocab, ids):
 
 
 def whitespace_tokenize(text):
-  """Runs basic whitespace cleaning and splitting on a peice of text."""
+  """Runs basic whitespace cleaning and splitting on a piece of text."""
   text = text.strip()
   if not text:
     return []
@@ -118,11 +123,19 @@ class FullTokenizer(object):
 
   def tokenize(self, text):
     split_tokens = []
+
+    # english in case of korean it returns [UNK] for all words
     for token in self.basic_tokenizer.tokenize(text):
       for sub_token in self.wordpiece_tokenizer.tokenize(token):
         split_tokens.append(sub_token)
 
+    with open('token_check', 'a', encoding='utf-8') as f_w:
+      for token in split_tokens:
+        f_w.write('%s  ' %(token))
+      f_w.write('\n')
+    
     return split_tokens
+
 
   def convert_tokens_to_ids(self, tokens):
     return convert_by_vocab(self.vocab, tokens)
@@ -155,15 +168,23 @@ class BasicTokenizer(object):
     # words in the English Wikipedia.).
     text = self._tokenize_chinese_chars(text)
 
-    orig_tokens = whitespace_tokenize(text)
-    split_tokens = []
-    for token in orig_tokens:
-      if self.do_lower_case:
-        token = token.lower()
-        token = self._run_strip_accents(token)
-      split_tokens.extend(self._run_split_on_punc(token))
+    # in case of korean just tokenize with mor-analysis
 
-    output_tokens = whitespace_tokenize(" ".join(split_tokens))
+    if self.__is_korean_char(text):
+      output_tokens = self._tokenize_korean_chars(text)
+    else:
+      orig_tokens = whitespace_tokenize(text)
+
+      split_tokens = []
+      for token in orig_tokens:
+        if self.do_lower_case:
+          token = token.lower()
+          token = self._run_strip_accents(token)
+        split_tokens.extend(self._run_split_on_punc(token))
+      output_tokens = whitespace_tokenize(" ".join(split_tokens))
+
+    tf.logging.info('output_tokens : ', output_tokens)
+
     return output_tokens
 
   def _run_strip_accents(self, text):
@@ -232,6 +253,52 @@ class BasicTokenizer(object):
 
     return False
 
+  def __is_korean_char(self, text):
+    hangul = re.compile('[\u3131-\u3163\uac00-\ud7a3]+')
+    result = hangul.findall(text)
+    return len(result)
+
+  def get_mor_result(self, sentence):
+    # korea univ morpheme analyzer
+    m_command = "cd kmat/bin/;./kmat <<<\'" + sentence + "\' 2>/dev/null"
+    result = subprocess.check_output(m_command.encode(encoding='cp949', errors='ignore'), shell=True,
+                                     executable='/bin/bash')
+
+    mor_name_lists = []
+    mor_tags_lists = []
+
+    for each in result.decode(encoding='cp949', errors='ignore').split('\n'):
+      if len(each) > 0:
+        try:
+          mor_texts = each.split('\t')[1]
+        except:
+          print(each)
+        mor_results = mor_texts.split('+')
+
+        for each_mor in mor_results:
+          try:
+            mor_name_lists.append(each_mor.split('/')[0])
+            mor_tags_lists.append(each_mor.split('/')[1])
+          except:
+            mor_name_lists.append(each_mor.split('/')[0])
+            mor_tags_lists.append('SS')
+
+    return mor_name_lists, mor_tags_lists
+
+  def _tokenize_korean_chars(self, text):
+    """Do morpheme analysis"""
+    try:
+      mor_result = self.get_mor_result(text)[0]
+      mor_result_sentence = ' '.join(mor_result)
+      if len(mor_result_sentence) > 2:
+        mor_result = [each.lower() for each in mor_result]
+        return mor_result
+    except Exception as e:
+      print(e)
+
+    mor_result = []
+    return mor_result
+
   def _clean_text(self, text):
     """Performs invalid character removal and whitespace cleanup on text."""
     output = []
@@ -249,7 +316,7 @@ class BasicTokenizer(object):
 class WordpieceTokenizer(object):
   """Runs WordPiece tokenziation."""
 
-  def __init__(self, vocab, unk_token="[UNK]", max_input_chars_per_word=100):
+  def __init__(self, vocab, unk_token="[UNK]", max_input_chars_per_word=200):
     self.vocab = vocab
     self.unk_token = unk_token
     self.max_input_chars_per_word = max_input_chars_per_word
